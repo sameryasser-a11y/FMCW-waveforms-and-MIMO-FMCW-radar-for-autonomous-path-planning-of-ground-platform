@@ -3,12 +3,10 @@
 % Processing: Range FFT -> Doppler FFT -> Angle (FFT beamforming)
 % Outputs: Range profile, Range-Doppler map, Range-Angle map, simple detections
 %
-% Save as: fmcw_tdm_mimo_range_doppler_angle.m
-% Run: just press Run in MATLAB (no Phased Array Toolbox required)
 
 clear; clc; close all;
 
-%% 1) Constants + Radar/Waveform Design (aligned to report-like specs)
+%% 1) Constants + Radar/Waveform Design 
 c  = 3e8;                  % speed of light (m/s)
 fc = 77e9;                 % 77 GHz center frequency
 lambda = c/fc;
@@ -26,7 +24,7 @@ Ns = 256;                  % samples per chirp
 Fs = Ns/Tchirp;            % sample rate (Hz)
 t  = (0:Ns-1).'/Fs;        % fast-time samples (column)
 
-% Total chirps in a frame (even for TDM)
+% Total chirps in a frame 
 Nchirps_total = 256;       % 256 total => 128 per TX stream
 
 % Effective PRF per TX stream (TX alternates, so each TX repeats every 2*Tchirp)
@@ -39,7 +37,7 @@ Vmax = lambda/(8*Tchirp);         % TDM halves PRF -> Vmax reduces
 fprintf("dR=%.2f m, Rmax≈%.1f m, Vmax≈%.1f m/s (%.0f km/h)\n", ...
     dR, Rmax, Vmax, Vmax*3.6);
 
-%% 2) Antenna Geometry (TDM-MIMO Virtual ULA)
+%% 2) Antenna Geometry (TDM-MIMO)
 numTx = 2;
 numRx = 4;
 
