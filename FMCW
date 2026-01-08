@@ -1,0 +1,243 @@
+%% FMCW TDM-MIMO Radar Simulation 
+% 77 GHz automotive FMCW radar with TDM-MIMO (2Tx, 4Rx -> 8 virtual elements)
+% Processing: Range FFT -> Doppler FFT -> Angle (FFT beamforming)
+% Outputs: Range profile, Range-Doppler map, Range-Angle map, simple detections
+%
+% Save as: fmcw_tdm_mimo_range_doppler_angle.m
+% Run: just press Run in MATLAB (no Phased Array Toolbox required)
+
+clear; clc; close all;
+
+%% 1) Constants + Radar/Waveform Design (aligned to report-like specs)
+c  = 3e8;                  % speed of light (m/s)
+fc = 77e9;                 % 77 GHz center frequency
+lambda = c/fc;
+
+% Target range resolution ~0.5 m -> BW = c/(2*dR) = 300 MHz
+dR_target = 0.5;           % meters
+BW     = c/(2*dR_target);  % 300e6 Hz
+
+% Short chirp helps keep unambiguous velocity high under TDM
+Tchirp = 10e-6;            % 10 microseconds
+S      = BW/Tchirp;        % chirp slope (Hz/s)
+
+% ADC sampling
+Ns = 256;                  % samples per chirp
+Fs = Ns/Tchirp;            % sample rate (Hz)
+t  = (0:Ns-1).'/Fs;        % fast-time samples (column)
+
+% Total chirps in a frame (even for TDM)
+Nchirps_total = 256;       % 256 total => 128 per TX stream
+
+% Effective PRF per TX stream (TX alternates, so each TX repeats every 2*Tchirp)
+PRF_eff = 1/(2*Tchirp);
+
+% Derived metrics
+dR   = c/(2*BW);
+Rmax = (Fs*c)/(2*S);              % approx max range
+Vmax = lambda/(8*Tchirp);         % TDM halves PRF -> Vmax reduces
+fprintf("dR=%.2f m, Rmax≈%.1f m, Vmax≈%.1f m/s (%.0f km/h)\n", ...
+    dR, Rmax, Vmax, Vmax*3.6);
+
+%% 2) Antenna Geometry (TDM-MIMO Virtual ULA)
+numTx = 2;
+numRx = 4;
+
+% RX spacing: lambda/2
+d = lambda/2;
+rxPos = (0:numRx-1)*d;
+
+% TX spacing: 2*lambda (= 4*d) to form a uniform virtual array
+txPos = [0, 4*d];
+
+% Virtual positions (8 elements)
+virtPos = sort([rxPos + txPos(1), rxPos + txPos(2)]);
+Nv = numTx*numRx;
+
+% Field of View 180°, angle grid 5°
+angGrid = -90:5:90;
+
+%% 3) Scenario (targets for autonomous ground platform perception)
+% Each target has initial range R0, radial velocity v, azimuth ang, amplitude amp
+targets = struct();
+targets(1).R0   = 35;     % meters
+targets(1).v    = 3;      % m/s (moving away)
+targets(1).ang  = -10;    % degrees
+targets(1).amp  = 1.0;
+
+targets(2).R0   = 60;     % meters
+targets(2).v    = -2;     % m/s (approaching)
+targets(2).ang  = 15;     % degrees
+targets(2).amp  = 0.8;
+
+K = numel(targets);
+
+% Noise (optional)
+addNoise = true;
+noiseSigma = 0.02;
+
+%% 4) Baseband FMCW chirp
+% Baseband chirp (carrier removed): exp(j*pi*S*t^2)
+txChirp = exp(1j*pi*S*t.^2);
+
+%% 5) Simulate TDM data collection: dataADC(Ns, numRx, Nchirps_total)
+% Chirps alternate TX1, TX2, TX1, TX2...
+dataADC = complex(zeros(Ns, numRx, Nchirps_total));
+
+for m = 1:Nchirps_total
+    txIdx = 1 + mod(m-1, numTx);          % 1,2,1,2,...
+    tSlow = (m-1)*Tchirp;                 % slow-time for chirp start
+
+    for rxi = 1:numRx
+        sig = complex(zeros(Ns,1));
+        elemPos = rxPos(rxi) + txPos(txIdx);
+
+        for k = 1:K
+            % Range evolves over time due to velocity
+            Rm  = targets(k).R0 + targets(k).v*tSlow;
+
+            % Round-trip delay
+            tau = 2*Rm/c;
+
+            % Doppler frequency
+            fd = 2*targets(k).v/lambda;
+
+            % AoA phase across array
+            phi_ang = 2*pi*(elemPos/lambda)*sin(deg2rad(targets(k).ang));
+
+            % Received chirp (delayed + doppler + AoA phase)
+            rxChirp = targets(k).amp ...
+                .* exp(1j*pi*S*(t - tau).^2) ...
+                .* exp(1j*2*pi*fd*(t + tSlow)) ...
+                .* exp(1j*phi_ang);
+
+            % Dechirp (mix) -> beat signal
+            sig = sig + txChirp .* conj(rxChirp);
+        end
+
+        if addNoise
+            sig = sig + noiseSigma*(randn(Ns,1) + 1j*randn(Ns,1));
+        end
+
+        dataADC(:, rxi, m) = sig;
+    end
+end
+
+%% 6) Form Virtual Array Data: dataVirt(Ns, Nv, Nsnap)
+% Odd chirps = TX1; even chirps = TX2
+tx1 = dataADC(:,:,1:2:end);   % (Ns, numRx, Nsnap)
+tx2 = dataADC(:,:,2:2:end);
+Nsnap = size(tx1,3);
+
+dataVirt = complex(zeros(Ns, Nv, Nsnap));
+dataVirt(:, 1:numRx, :)       = tx1;
+dataVirt(:, numRx+1:end, :)   = tx2;
+
+%% 7) Range FFT
+NfftR = 512;
+wR = hann(Ns);
+dataR = dataVirt .* reshape(wR, [], 1, 1);
+
+rangeFFT = fft(dataR, NfftR, 1);
+rangeFFT = rangeFFT(1:NfftR/2, :, :);
+
+fbeat = (0:NfftR/2-1).' * (Fs/NfftR);
+Raxis = (c * fbeat) / (2*S);
+
+% Average range profile
+rangeProfile = mean(abs(rangeFFT), [2 3]);
+
+figure('Name','Range Profile');
+plot(Raxis, 20*log10(rangeProfile/max(rangeProfile) + 1e-12));
+grid on; xlabel('Range (m)'); ylabel('Magnitude (dB, norm)');
+title('Range Profile (avg over virtual channels & chirps)');
+xlim([0 120]);
+
+%% 8) Range-Doppler Map (2D FFT on one virtual channel)
+chanForRD = 1;
+RDin = squeeze(rangeFFT(:, chanForRD, :));    % (Nr, Nsnap)
+
+NfftD = 256;
+wD = hann(Nsnap).';
+RDinW = RDin .* wD;
+
+RD = fftshift(fft(RDinW, NfftD, 2), 2);
+RDmag = abs(RD);
+RDdB  = 20*log10(RDmag/max(RDmag(:)) + 1e-12);
+
+fdAxis = ((-NfftD/2):(NfftD/2-1))*(PRF_eff/NfftD);
+vAxis  = (lambda*fdAxis)/2;
+
+figure('Name','Range-Doppler');
+imagesc(vAxis, Raxis, RDdB);
+axis xy; colorbar;
+xlabel('Velocity (m/s)'); ylabel('Range (m)');
+title('Range-Doppler Map (2D FFT, norm dB)');
+ylim([0 120]);
+caxis([-40 0]);
+
+%% 9) Range-Angle Map (Virtual Array FFT Beamforming)
+Nr = size(rangeFFT,1);
+
+% Steering matrix
+A = zeros(Nv, numel(angGrid));
+for ia = 1:numel(angGrid)
+    A(:,ia) = exp(1j*2*pi*(virtPos.'/lambda)*sin(deg2rad(angGrid(ia))));
+end
+
+% Build RA heatmap: pick strongest Doppler bin per range
+RA = zeros(Nr, numel(angGrid));
+
+for ir = 1:Nr
+    Xrv = squeeze(rangeFFT(ir, :, :));         % (Nv, Nsnap)
+    Xd  = fftshift(fft(Xrv, NfftD, 2), 2);     % (Nv, NfftD)
+
+    pD = sum(abs(Xd).^2, 1);
+    [~, idxMaxD] = max(pD);
+
+    x = Xd(:, idxMaxD);
+    bf = A' * x;
+    RA(ir,:) = abs(bf).^2;
+end
+
+RAdB = 10*log10(RA/max(RA(:)) + 1e-12);
+
+figure('Name','Range-Angle');
+imagesc(angGrid, Raxis, RAdB);
+axis xy; colorbar;
+xlabel('Azimuth angle (deg)'); ylabel('Range (m)');
+title('Range-Angle Map (Virtual Array Beamforming, norm dB)');
+ylim([0 120]);
+caxis([-30 0]);
+
+%% 10) Simple detections (top peaks on Range-Angle)
+numDet = 4;
+maskR = (Raxis <= 120);
+RAcut = RA(maskR,:);
+Raxis_cut = Raxis(maskR);
+
+flat = RAcut(:);
+[~, idx] = sort(flat, 'descend');
+idx = idx(1:min(numDet, numel(idx)));
+
+fprintf("\nTop detections (simple peak picks):\n");
+fprintf("  Range (m) | Angle (deg)\n");
+for n = 1:numel(idx)
+    [ir, ia] = ind2sub(size(RAcut), idx(n));
+    fprintf("  %8.2f | %9.1f\n", Raxis_cut(ir), angGrid(ia));
+end
+
+% Estimate velocity from strongest RD peak (demo)
+RDmask = (Raxis <= 120);
+RDsub = RDmag(RDmask, :);
+[~, linIdx] = max(RDsub(:));
+[rIdx, dIdx] = ind2sub(size(RDsub), linIdx);
+
+estRanges = Raxis(RDmask);
+estRange = estRanges(rIdx);
+estVel   = vAxis(dIdx);
+
+fprintf("\nStrongest RD peak (channel %d): Range≈%.2f m, Velocity≈%.2f m/s\n", ...
+    chanForRD, estRange, estVel);
+
+disp("Done.");
